@@ -1,0 +1,142 @@
+### Suggested Changes for a Text-Focused Workflow
+
+Here is a suggested workflow that aligns with your goal: "first generate data, then convert to text then put it to sql table and the query table". This approach will use a native BigQuery table instead of an external one over GCS, and will focus on converting the generated multimodal data into text.
+
+#### Step 1: Generate Image and Speech (No Changes Needed)
+
+The first part of your notebook that generates an image, a music prompt, and a speech file is perfect. Keep cells 1 to 15 as they are. This will generate the assets and upload them to Google Cloud Storage.
+
+#### Step 2: Convert Multimodal Data to Text
+
+After uploading the files to GCS (cell 15), you can add new cells to convert the image and speech to text.
+
+**New cell after cell 15: Add Image-to-Text Conversion**
+
+You can use a Gemini model to describe the image you generated.
+
+```python
+from vertexai.generative_models import GenerativeModel, Part
+
+# Load the model
+vision_model = GenerativeModel("gemini-pro-vision")
+
+# Generate content
+image_file = Part.from_uri(image_gcs_uri, mime_type="image/png")
+prompt_for_image = "Describe this image in one sentence."
+
+response = vision_model.generate_content([image_file, prompt_for_image])
+image_description = response.text
+print(f"Image Description: {image_description}")
+```
+
+**New cell: Add Speech-to-Text Installation**
+
+First, you'll need to install the library.
+
+```python
+%pip install --upgrade --user google-cloud-speech
+```
+
+**New cell: Add Speech-to-Text Conversion**
+
+Then, add a cell to perform the transcription.
+
+```python
+from google.cloud import speech
+
+def transcribe_gcs(gcs_uri: str) -> str:
+    """Asynchronously transcribes the audio file specified by the GCS URI."""
+    client = speech.SpeechClient()
+
+    audio = speech.RecognitionAudio(uri=gcs_uri)
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.MP3,
+        sample_rate_hertz=24000, # This might need adjustment based on TTS output
+        language_code="en-US",
+    )
+
+    operation = client.long_running_recognize(config=config, audio=audio)
+
+    print("Waiting for operation to complete...")
+    response = operation.result(timeout=90)
+
+    transcript = ""
+    for result in response.results:
+        transcript += result.alternatives[0].transcript
+        
+    return transcript
+
+speech_text = transcribe_gcs(speech_gcs_uri)
+print(f"Transcribed Speech: {speech_text}")
+```
+
+#### Step 3: Create and Populate a Native BigQuery Table
+
+Instead of creating an external table pointing to a JSONL file in GCS, you can create a native BigQuery table and insert the text data you've just generated.
+
+**New cell: Prepare data for BigQuery**
+
+First, prepare the data to be inserted.
+
+```python
+import json
+
+text_data = [
+    {"source_type": "image_description", "text_content": image_description},
+    {"source_type": "music_prompt", "text_content": music_prompt},
+    {"source_type": "speech_transcription", "text_content": speech_text},
+]
+```
+
+**Replace cell 17 and 18 with this: Create and Populate BigQuery Table**
+
+```python
+from google.cloud import bigquery
+
+bq_client = bigquery.Client()
+
+dataset_id = f"{PROJECT_ID}.{BIGQUERY_DATASET}"
+try:
+    bq_client.get_dataset(dataset_id)
+    print(f"Dataset {dataset_id} already exists.")
+except Exception:
+    dataset = bigquery.Dataset(dataset_id)
+    dataset.location = LOCATION
+    dataset = bq_client.create_dataset(dataset, timeout=30)
+    print(f"Created dataset {PROJECT_ID}.{dataset.dataset_id}")
+
+table_id = f"{dataset_id}.generated_text_data"
+schema = [
+    bigquery.SchemaField("source_type", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("text_content", "STRING", mode="REQUIRED"),
+]
+table = bigquery.Table(table_id, schema=schema)
+table = bq_client.create_table(table, exists_ok=True)
+print(f"Created table {table.project}.{table.dataset_id}.{table.table_id}")
+
+# Insert data into the table
+errors = bq_client.insert_rows_json(table, text_data)
+if errors == []:
+    print("New rows have been added.")
+else:
+    print(f"Encountered errors while inserting rows: {errors}")
+```
+
+#### Step 4: Query the BigQuery Table
+
+Finally, you can query your new BigQuery table.
+
+**Replace cells 20 and 21 with this: Query the BigQuery Table**
+
+```python
+sql_query = f"""
+SELECT
+    source_type,
+    text_content
+FROM
+    `{table_id}`
+"""
+
+df = bq_client.query(sql_query).to_dataframe()
+print(df.to_markdown())
+```
